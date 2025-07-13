@@ -23,7 +23,7 @@ AUTHORIZED_CHAT_IDS = [
 
 # Switcher Breeze Configuration - using environment variables
 # IMPORTANT: Replace YOUR_PUBLIC_IP_HERE with your actual public IP from whatismyipaddress.com
-DEVICE_IP = os.getenv("DEVICE_IP", "YOUR_PUBLIC_IP_HERE")  # Your public IP goes here
+DEVICE_IP = os.getenv("DEVICE_IP", "46.120.215.94")  # Your public IP goes here
 DEVICE_ID = os.getenv("DEVICE_ID", "645eb7")
 DEVICE_KEY = os.getenv("DEVICE_KEY", "03")
 TOKEN = os.getenv("SWITCHER_TOKEN", "yr60o/WGJZVRCxBd6ywclg==")
