@@ -318,8 +318,14 @@ def main():
             logger.error("Example: telegram-ac-bot-xyz.onrender.com")
             return
         
-        webhook_url = f"https://{render_url}/webhook"
-        logger.info(f"Using webhook URL: {webhook_url}")
+        # Handle URLs that may or may not include https://
+        if render_url.startswith('https://'):
+            webhook_url = f"{render_url}/webhook"
+        else:
+                webhook_url = f"https://{render_url}/webhook"
+        
+        logger.info(f"Raw RENDER_EXTERNAL_URL: '{render_url}'")
+        logger.info(f"Final webhook URL: '{webhook_url}'")
         
         # Cloud deployment with webhook
         logger.info(f"Starting webhook mode on port {port}")
@@ -333,6 +339,7 @@ def main():
         # Local testing with polling
         logger.info("Starting polling mode for local testing")
         application.run_polling()
+
 
 
 if __name__ == "__main__":
