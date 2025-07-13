@@ -309,18 +309,31 @@ def main():
     # Use webhook for cloud deployment (if PORT is set) or polling for local testing
     port = int(os.environ.get("PORT", 0))
     if port:
+        # Get the webhook URL - try multiple environment variables
+        render_url = os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('RENDER_SERVICE_URL')
+        
+        if not render_url:
+            logger.error("ERROR: RENDER_EXTERNAL_URL environment variable not set!")
+            logger.error("Please set RENDER_EXTERNAL_URL to your Render app URL in the dashboard")
+            logger.error("Example: telegram-ac-bot-xyz.onrender.com")
+            return
+        
+        webhook_url = f"https://{render_url}/webhook"
+        logger.info(f"Using webhook URL: {webhook_url}")
+        
         # Cloud deployment with webhook
         logger.info(f"Starting webhook mode on port {port}")
         application.run_webhook(
             listen="0.0.0.0",
             port=port,
             url_path="webhook",
-            webhook_url=f"https://{os.environ.get('RENDER_EXTERNAL_URL', '')}/webhook"
+            webhook_url=webhook_url
         )
     else:
         # Local testing with polling
         logger.info("Starting polling mode for local testing")
         application.run_polling()
+
 
 if __name__ == "__main__":
     main()
