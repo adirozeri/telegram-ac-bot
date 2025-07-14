@@ -42,10 +42,24 @@ class ACController:
             async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
                 state = await api.get_breeze_state()
                 logger.info(f"AC status retrieved: {state}")
-                return f"AC Status: {state}"
+                
+                # Format the response in a user-friendly way
+                status_text = f"""🌡️ **AC Status**
+                
+**Power:** {"🟢 ON" if state.state.name == "ON" else "🔴 OFF"}
+**Mode:** {state.mode.name.title()}
+**Current Temp:** {state.temperature}°C
+**Target Temp:** {state.target_temperature}°C
+**Fan Level:** {state.fan_level.name.title()}
+**Swing:** {state.swing.name.title()}
+**Remote ID:** {state.remote_id}
+                """
+                
+                return status_text
         except Exception as e:
             logger.error(f"Error getting AC status: {e}")
-            return f"Error getting status: {str(e)}"
+            return f"❌ Error getting status: {str(e)}"
+            
     
     async def turn_on_cooling(self, temperature=24):
         """Turn on AC with cooling"""
@@ -149,30 +163,16 @@ Running 24/7 in the cloud!
     """
     await update.message.reply_text(welcome_text)
 
-async def get_status(self):
-        """Get AC status"""
-        try:
-            logger.info(f"Getting AC status from {DEVICE_IP}")
-            async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
-                state = await api.get_breeze_state()
-                logger.info(f"AC status retrieved: {state}")
-                
-                # Format the response in a user-friendly way
-                status_text = f"""🌡️ **AC Status**
-                
-**Power:** {"🟢 ON" if state.state.name == "ON" else "🔴 OFF"}
-**Mode:** {state.mode.name.title()}
-**Current Temp:** {state.temperature}°C
-**Target Temp:** {state.target_temperature}°C
-**Fan Level:** {state.fan_level.name.title()}
-**Swing:** {state.swing.name.title()}
-**Remote ID:** {state.remote_id}
-                """
-                
-                return status_text
-        except Exception as e:
-            logger.error(f"Error getting AC status: {e}")
-            return f"❌ Error getting status: {str(e)}"
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Get AC status"""
+    if not check_authorization(update):
+        await update.message.reply_text("Unauthorized access")
+        return
+    
+    logger.info(f"Status command from user: {update.effective_chat.id}")
+    await update.message.reply_text("Checking AC status...")
+    result = await ac.get_status()
+    await update.message.reply_text(result)
 
 
 async def cool_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
