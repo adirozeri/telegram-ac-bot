@@ -286,6 +286,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
 
+# Replace the webhook section in your main() function with this:
+
 def main():
     """Start the bot"""
     logger.info("=== STARTING TELEGRAM AC CONTROLLER BOT ===")
