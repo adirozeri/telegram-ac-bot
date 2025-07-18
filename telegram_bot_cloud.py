@@ -1,8 +1,12 @@
 import asyncio
 import logging
 import os
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+import platform
+import socket
+import psutil
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from aioswitcher.api import SwitcherApi
 from aioswitcher.api.remotes import SwitcherBreezeRemoteManager
 from aioswitcher.device import DeviceType, DeviceState, ThermostatFanLevel, ThermostatMode, ThermostatSwing
@@ -15,15 +19,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot Configuration - using environment variables for security
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7749658228:AAHVodV0YEWj-drf5MUGZWob5IG-mU-CSYw")
+BOT_TOKEN = "7749658228:AAHVodV0YEWj-drf5MUGZWob5IG-mU-CSYw"
 AUTHORIZED_CHAT_IDS = [
     int(os.getenv("CHAT_ID_1", "999186130")),
     int(os.getenv("CHAT_ID_2", "922682443"))
 ]
 
 # Switcher Breeze Configuration - using environment variables
-# IMPORTANT: Replace YOUR_PUBLIC_IP_HERE with your actual public IP from whatismyipaddress.com
-DEVICE_IP = os.getenv("DEVICE_IP", "46.120.215.94")  # Your public IP goes here
+DEVICE_IP = os.getenv("DEVICE_IP", "46.120.215.94")
 DEVICE_ID = os.getenv("DEVICE_ID", "645eb7")
 DEVICE_KEY = os.getenv("DEVICE_KEY", "03")
 TOKEN = os.getenv("SWITCHER_TOKEN", "yr60o/WGJZVRCxBd6ywclg==")
@@ -31,104 +34,122 @@ REMOTE_ID = os.getenv("REMOTE_ID", "ELEC7009")
 
 DEVICE_TYPE = DeviceType.BREEZE
 
+# Global variables for AC state management
+ac_state = {
+    "is_on": False,
+    "mode": "COOL",
+    "temperature": 24,
+    "last_updated": None,
+    "timer_task": None,
+    "timer_end": None
+}
+
+# Timers storage
+active_timers = {}
+
 class ACController:
     def __init__(self):
         self.remote_manager = SwitcherBreezeRemoteManager()
     
     async def get_status(self):
-        """Get AC status"""
+        """Get AC status from Switcher device"""
         try:
             logger.info(f"Getting AC status from {DEVICE_IP}")
             async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
                 state = await api.get_breeze_state()
                 logger.info(f"AC status retrieved: {state}")
                 
-                # Format the response in a user-friendly way
-                status_text = f"""🌡️ **AC Status**
+                # Update global state
+                global ac_state
+                ac_state["is_on"] = state.state.name == "ON"
+                ac_state["mode"] = state.mode.name
+                ac_state["temperature"] = state.target_temperature
+                ac_state["last_updated"] = datetime.now()
                 
-**Power:** {"🟢 ON" if state.state.name == "ON" else "🔴 OFF"}
-**Mode:** {state.mode.name.title()}
-**Current Temp:** {state.temperature}°C
-**Target Temp:** {state.target_temperature}°C
-**Fan Level:** {state.fan_level.name.title()}
-**Swing:** {state.swing.name.title()}
-**Remote ID:** {state.remote_id}
-                """
-                
-                return status_text
+                return state
         except Exception as e:
             logger.error(f"Error getting AC status: {e}")
-            return f"❌ Error getting status: {str(e)}"
-            
+            return None
     
-    async def turn_on_cooling(self, temperature=24):
-        """Turn on AC with cooling"""
+    async def control_ac(self, power_state, mode, temperature):
+        """Control AC with specified parameters"""
         try:
-            logger.info(f"Turning on AC cooling to {temperature}C")
+            logger.info(f"Controlling AC: {power_state}, {mode}, {temperature}C")
             async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
                 remote = self.remote_manager.get_remote(REMOTE_ID)
+                
+                # Map mode strings to enum values
+                mode_mapping = {
+                    "COOL": ThermostatMode.COOL,
+                    "HEAT": ThermostatMode.HEAT,
+                    "FAN": ThermostatMode.FAN
+                }
+                
                 await api.control_breeze_device(
-                    remote, DeviceState.ON, ThermostatMode.COOL, temperature,
-                    ThermostatFanLevel.MEDIUM, ThermostatSwing.OFF
+                    remote, 
+                    DeviceState.ON if power_state else DeviceState.OFF,
+                    mode_mapping.get(mode, ThermostatMode.COOL),
+                    temperature,
+                    ThermostatFanLevel.MEDIUM,
+                    ThermostatSwing.OFF
                 )
-                logger.info(f"AC turned ON - Cooling {temperature}C")
-                return f"AC turned ON - Cooling {temperature}C"
+                
+                # Update global state
+                global ac_state
+                ac_state["is_on"] = power_state
+                ac_state["mode"] = mode
+                ac_state["temperature"] = temperature
+                ac_state["last_updated"] = datetime.now()
+                
+                logger.info(f"AC control successful")
+                return True
         except Exception as e:
-            logger.error(f"Error turning on AC cooling: {e}")
-            return f"Error turning on AC: {str(e)}"
-    
-    async def turn_on_heating(self, temperature=22):
-        """Turn on AC with heating"""
-        try:
-            logger.info(f"Turning on AC heating to {temperature}C")
-            async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
-                remote = self.remote_manager.get_remote(REMOTE_ID)
-                await api.control_breeze_device(
-                    remote, DeviceState.ON, ThermostatMode.HEAT, temperature,
-                    ThermostatFanLevel.MEDIUM, ThermostatSwing.OFF
-                )
-                logger.info(f"AC turned ON - Heating {temperature}C")
-                return f"AC turned ON - Heating {temperature}C"
-        except Exception as e:
-            logger.error(f"Error turning on AC heating: {e}")
-            return f"Error turning on heating: {str(e)}"
-    
-    async def turn_off(self):
-        """Turn off AC"""
-        try:
-            logger.info("Turning off AC")
-            async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
-                remote = self.remote_manager.get_remote(REMOTE_ID)
-                await api.control_breeze_device(
-                    remote, DeviceState.OFF, ThermostatMode.COOL, 24,
-                    ThermostatFanLevel.MEDIUM, ThermostatSwing.OFF
-                )
-                logger.info("AC turned OFF")
-                return "AC turned OFF"
-        except Exception as e:
-            logger.error(f"Error turning off AC: {e}")
-            return f"Error turning off AC: {str(e)}"
-    
-    async def fan_only(self):
-        """Set AC to fan only mode"""
-        try:
-            logger.info("Setting AC to fan only mode")
-            async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
-                remote = self.remote_manager.get_remote(REMOTE_ID)
-                await api.control_breeze_device(
-                    remote, DeviceState.ON, ThermostatMode.FAN, 24,
-                    ThermostatFanLevel.MEDIUM, ThermostatSwing.OFF
-                )
-                logger.info("AC set to FAN mode")
-                return "AC set to FAN mode"
-        except Exception as e:
-            logger.error(f"Error setting fan mode: {e}")
-            return f"Error setting fan mode: {str(e)}"
+            logger.error(f"Error controlling AC: {e}")
+            return False
 
 # Initialize AC controller
 ac = ACController()
 
-# Security check
+def get_system_info():
+    """Get system information for monitoring"""
+    try:
+        # Determine deployment type
+        if os.getenv("RENDER"):
+            deployment = "🌐 Render Cloud"
+        elif os.getenv("RAILWAY_PROJECT_ID"):
+            deployment = "🚂 Railway"
+        elif os.getenv("HEROKU_APP_NAME"):
+            deployment = "🟣 Heroku"
+        elif os.path.exists("/home/pi"):
+            deployment = "🥧 Raspberry Pi"
+        else:
+            deployment = "💻 Local Computer"
+        
+        # Get IP address
+        try:
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+        except:
+            local_ip = "Unknown"
+        
+        # Get system stats
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory = psutil.virtual_memory()
+        
+        return {
+            "deployment": deployment,
+            "hostname": hostname,
+            "local_ip": local_ip,
+            "platform": platform.system(),
+            "cpu_percent": cpu_percent,
+            "memory_percent": memory.percent,
+            "python_version": platform.python_version(),
+            "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+    except Exception as e:
+        logger.error(f"Error getting system info: {e}")
+        return {"deployment": "Unknown", "error": str(e)}
+
 def check_authorization(update: Update) -> bool:
     """Check if user is authorized"""
     user_id = update.effective_chat.id
@@ -137,215 +158,363 @@ def check_authorization(update: Update) -> bool:
         logger.warning(f"Unauthorized access attempt from user ID: {user_id}")
     return authorized
 
-# Bot command handlers
+def get_main_menu():
+    """Create main menu keyboard"""
+    global ac_state
+    
+    # Toggle button changes based on current state
+    if ac_state["is_on"]:
+        toggle_button = InlineKeyboardButton("❄️ Turn OFF", callback_data="toggle_power")
+    else:
+        toggle_button = InlineKeyboardButton("🔥 Turn ON", callback_data="toggle_power")
+    
+    keyboard = [
+        [toggle_button],
+        [
+            InlineKeyboardButton("🌡️ Set Temperature", callback_data="set_temp"),
+            InlineKeyboardButton("📊 Status", callback_data="status")
+        ],
+        [
+            InlineKeyboardButton("⏱️ Set Timer", callback_data="set_timer"),
+            InlineKeyboardButton("🔄 Refresh Menu", callback_data="refresh")
+        ],
+        [
+            InlineKeyboardButton("📍 Set State", callback_data="set_state")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_temperature_menu():
+    """Create temperature selection menu"""
+    keyboard = []
+    # Create temperature buttons in rows of 3
+    temps = list(range(16, 31))  # 16-30°C
+    for i in range(0, len(temps), 3):
+        row = []
+        for temp in temps[i:i+3]:
+            row.append(InlineKeyboardButton(f"{temp}°C", callback_data=f"temp_{temp}"))
+        keyboard.append(row)
+    
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_state_menu():
+    """Create state setting menu"""
+    keyboard = [
+        [
+            InlineKeyboardButton("🟢 AC is ON", callback_data="manual_state_on"),
+            InlineKeyboardButton("🔴 AC is OFF", callback_data="manual_state_off")
+        ],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_timer_menu():
+    """Create timer selection menu"""
+    keyboard = [
+        [
+            InlineKeyboardButton("5 min", callback_data="timer_5"),
+            InlineKeyboardButton("10 min", callback_data="timer_10"),
+            InlineKeyboardButton("15 min", callback_data="timer_15")
+        ],
+        [
+            InlineKeyboardButton("30 min", callback_data="timer_30"),
+            InlineKeyboardButton("1 hour", callback_data="timer_60"),
+            InlineKeyboardButton("2 hours", callback_data="timer_120")
+        ],
+        [
+            InlineKeyboardButton("❌ Cancel Timer", callback_data="cancel_timer"),
+            InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def format_status_message():
+    """Format AC status message"""
+    global ac_state
+    
+    status_emoji = "🟢 ON" if ac_state["is_on"] else "🔴 OFF"
+    
+    timer_info = ""
+    if ac_state["timer_end"]:
+        remaining = ac_state["timer_end"] - datetime.now()
+        if remaining.total_seconds() > 0:
+            minutes = int(remaining.total_seconds() / 60)
+            timer_info = f"\n⏰ Timer: {minutes} min remaining"
+        else:
+            timer_info = "\n⏰ Timer: Expired"
+    
+    last_update = "Never" if not ac_state["last_updated"] else ac_state["last_updated"].strftime("%H:%M:%S")
+    
+    return f"""🌡️ **AC Status**
+
+**Power:** {status_emoji}
+**Mode:** {ac_state["mode"]}
+**Temperature:** {ac_state["temperature"]}°C
+**Last Updated:** {last_update}{timer_info}
+
+Use the menu below to control your AC:"""
+
+async def set_ac_timer(chat_id, minutes, context):
+    """Set a timer to turn off AC"""
+    global ac_state, active_timers
+    
+    # Cancel existing timer if any
+    if ac_state["timer_task"]:
+        ac_state["timer_task"].cancel()
+    
+    # Set new timer
+    ac_state["timer_end"] = datetime.now() + timedelta(minutes=minutes)
+    
+    async def timer_callback():
+        await asyncio.sleep(minutes * 60)
+        # Turn off AC
+        success = await ac.control_ac(False, "COOL", 24)
+        if success:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⏰ Timer expired! AC turned OFF after {minutes} minutes."
+            )
+            ac_state["timer_task"] = None
+            ac_state["timer_end"] = None
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ Timer expired but failed to turn OFF AC. Please check manually."
+            )
+    
+    ac_state["timer_task"] = asyncio.create_task(timer_callback())
+
+# Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
+    """Start command with main menu"""
     if not check_authorization(update):
-        await update.message.reply_text("Unauthorized access")
+        await update.message.reply_text("❌ Unauthorized access")
         return
     
     logger.info(f"Start command from authorized user: {update.effective_chat.id}")
-    welcome_text = """
-AC Controller Bot - Cloud Version
+    
+    welcome_text = f"""🤖 **AC Controller Bot**
 
-Available commands:
-• 'on' or /cool - Turn on cooling (24C)
-• 'off' or /off - Turn off AC  
-• /heat - Turn on heating (22C)
-• /fan - Fan only mode
-• /status - Check AC status
-• /cool 26 - Cool to specific temperature
-• /heat 20 - Heat to specific temperature
+{format_status_message()}"""
+    
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=get_main_menu(),
+        parse_mode='Markdown'
+    )
 
-Just type "on" or "off" for quick control! 
-
-Running 24/7 in the cloud!
-    """
-    await update.message.reply_text(welcome_text)
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Get AC status"""
+async def where_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show system information"""
     if not check_authorization(update):
-        await update.message.reply_text("Unauthorized access")
+        await update.message.reply_text("❌ Unauthorized access")
         return
     
-    logger.info(f"Status command from user: {update.effective_chat.id}")
-    await update.message.reply_text("Checking AC status...")
-    result = await ac.get_status()
-    await update.message.reply_text(result)
+    info = get_system_info()
+    
+    message = f"""🖥️ **System Information**
 
+**Deployment:** {info['deployment']}
+**Hostname:** {info.get('hostname', 'Unknown')}
+**Local IP:** {info.get('local_ip', 'Unknown')}
+**Platform:** {info.get('platform', 'Unknown')}
+**CPU Usage:** {info.get('cpu_percent', 0):.1f}%
+**Memory Usage:** {info.get('memory_percent', 0):.1f}%
+**Python Version:** {info.get('python_version', 'Unknown')}
+**Started:** {info.get('start_time', 'Unknown')}
+**Device IP:** {DEVICE_IP}
+**Device ID:** {DEVICE_ID}
+"""
+    
+    await update.message.reply_text(message, parse_mode='Markdown')
 
-async def cool_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Cool command with optional temperature"""
+async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard callbacks"""
     if not check_authorization(update):
-        await update.message.reply_text("Unauthorized access")
+        await update.callback_query.answer("❌ Unauthorized access")
         return
     
-    temp = 24  # default
-    if context.args:
-        try:
-            temp = int(context.args[0])
-            if not (16 <= temp <= 30):
-                await update.message.reply_text("Temperature must be between 16-30C")
-                return
-        except ValueError:
-            await update.message.reply_text("Invalid temperature")
-            return
+    query = update.callback_query
+    await query.answer()
     
-    logger.info(f"Cool command ({temp}C) from user: {update.effective_chat.id}")
-    await update.message.reply_text(f"Turning on cooling to {temp}C...")
-    result = await ac.turn_on_cooling(temp)
-    await update.message.reply_text(result)
-
-async def heat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Heat command with optional temperature"""
-    if not check_authorization(update):
-        await update.message.reply_text("Unauthorized access")
-        return
+    data = query.data
     
-    temp = 22  # default
-    if context.args:
-        try:
-            temp = int(context.args[0])
-            if not (16 <= temp <= 30):
-                await update.message.reply_text("Temperature must be between 16-30C")
-                return
-        except ValueError:
-            await update.message.reply_text("Invalid temperature")
-            return
+    if data == "toggle_power":
+        # Toggle AC power based on current state
+        if ac_state["is_on"]:
+            # AC is currently ON, so turn it OFF
+            await query.edit_message_text("🔄 Turning AC OFF...")
+            success = await ac.control_ac(False, "COOL", ac_state["temperature"])
+            if success:
+                message = f"✅ AC turned OFF successfully!\n\n{format_status_message()}"
+            else:
+                message = f"❌ Failed to turn OFF AC\n\n{format_status_message()}"
+        else:
+            # AC is currently OFF, so turn it ON
+            await query.edit_message_text("🔄 Turning AC ON...")
+            success = await ac.control_ac(True, "COOL", ac_state["temperature"])
+            if success:
+                message = f"✅ AC turned ON successfully!\n\n{format_status_message()}"
+            else:
+                message = f"❌ Failed to turn ON AC\n\n{format_status_message()}"
+        
+        await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
     
-    logger.info(f"Heat command ({temp}C) from user: {update.effective_chat.id}")
-    await update.message.reply_text(f"Turning on heating to {temp}C...")
-    result = await ac.turn_on_heating(temp)
-    await update.message.reply_text(result)
-
-async def off_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Turn off AC"""
-    if not check_authorization(update):
-        await update.message.reply_text("Unauthorized access")
-        return
+    elif data == "set_state":
+        await query.edit_message_text(
+            "📍 Manually set AC state in bot memory:\n\n(Use this to correct the bot's state when it gets out of sync with the actual AC)",
+            reply_markup=get_state_menu()
+        )
     
-    logger.info(f"Off command from user: {update.effective_chat.id}")
-    await update.message.reply_text("Turning off AC...")
-    result = await ac.turn_off()
-    await update.message.reply_text(result)
-
-async def fan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fan only mode"""
-    if not check_authorization(update):
-        await update.message.reply_text("Unauthorized access")
-        return
+    elif data == "manual_state_on":
+        # Manually set AC state to ON in bot memory only
+        ac_state["is_on"] = True
+        ac_state["last_updated"] = datetime.now()
+        message = f"✅ Bot state set to ON manually\n\n{format_status_message()}"
+        await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
     
-    logger.info(f"Fan command from user: {update.effective_chat.id}")
-    await update.message.reply_text("Setting fan only mode...")
-    result = await ac.fan_only()
-    await update.message.reply_text(result)
+    elif data == "manual_state_off":
+        # Manually set AC state to OFF in bot memory only
+        ac_state["is_on"] = False
+        ac_state["last_updated"] = datetime.now()
+        message = f"✅ Bot state set to OFF manually\n\n{format_status_message()}"
+        await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
+    
+    elif data == "set_temp":
+        await query.edit_message_text(
+            "🌡️ Select temperature:",
+            reply_markup=get_temperature_menu()
+        )
+    
+    elif data.startswith("temp_"):
+        temp = int(data.split("_")[1])
+        await query.edit_message_text(f"🔄 Setting temperature to {temp}°C...")
+        # Turn on AC with selected temperature
+        success = await ac.control_ac(True, "COOL", temp)
+        if success:
+            message = f"✅ AC set to {temp}°C!\n\n{format_status_message()}"
+        else:
+            message = f"❌ Failed to set temperature\n\n{format_status_message()}"
+        await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
+    
+    elif data == "status":
+        # Refresh status from device
+        await query.edit_message_text("🔄 Getting AC status...")
+        device_state = await ac.get_status()
+        if device_state:
+            message = f"📊 Status refreshed from device\n\n{format_status_message()}"
+        else:
+            message = f"❌ Failed to get status from device\n\n{format_status_message()}"
+        await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
+    
+    elif data == "set_timer":
+        await query.edit_message_text(
+            "⏱️ Set timer to turn OFF AC:",
+            reply_markup=get_timer_menu()
+        )
+    
+    elif data.startswith("timer_"):
+        minutes = int(data.split("_")[1])
+        await set_ac_timer(query.message.chat_id, minutes, context)
+        message = f"⏰ Timer set for {minutes} minutes!\n\n{format_status_message()}"
+        await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
+    
+    elif data == "cancel_timer":
+        if ac_state["timer_task"]:
+            ac_state["timer_task"].cancel()
+            ac_state["timer_task"] = None
+            ac_state["timer_end"] = None
+            message = f"⏰ Timer cancelled!\n\n{format_status_message()}"
+        else:
+            message = f"⏰ No active timer to cancel\n\n{format_status_message()}"
+        await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
+    
+    elif data == "refresh" or data == "back_to_main":
+        message = format_status_message()
+        await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle simple text messages like 'on' and 'off'"""
+    """Handle text messages by showing menu"""
     if not check_authorization(update):
-        await update.message.reply_text("Unauthorized access")
+        await update.message.reply_text("❌ Unauthorized access")
         return
     
-    text = update.message.text.lower().strip()
-    user_id = update.effective_chat.id
-    
-    if text in ['on', 'turn on', 'start', 'cool']:
-        logger.info(f"Text 'on' command from user: {user_id}")
-        await update.message.reply_text("Turning on cooling to 24C...")
-        result = await ac.turn_on_cooling(24)
-        await update.message.reply_text(result)
-    
-    elif text in ['off', 'turn off', 'stop']:
-        logger.info(f"Text 'off' command from user: {user_id}")
-        await update.message.reply_text("Turning off AC...")
-        result = await ac.turn_off()
-        await update.message.reply_text(result)
-    
-    elif text in ['status', 'check']:
-        logger.info(f"Text 'status' command from user: {user_id}")
-        await update.message.reply_text("Checking AC status...")
-        result = await ac.get_status()
-        await update.message.reply_text(result)
-    
-    elif text in ['fan', 'fan only']:
-        logger.info(f"Text 'fan' command from user: {user_id}")
-        await update.message.reply_text("Setting fan only mode...")
-        result = await ac.fan_only()
-        await update.message.reply_text(result)
-    
-    else:
-        await update.message.reply_text(
-            "I don't understand. Try:\n"
-            "• 'on' or 'off'\n"
-            "• /cool or /heat\n"
-            "• /status for AC status"
-        )
+    # Always respond with the menu
+    message = f"🤖 Use the menu below to control your AC:\n\n{format_status_message()}"
+    await update.message.reply_text(
+        message,
+        reply_markup=get_main_menu(),
+        parse_mode='Markdown'
+    )
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
 
-# Replace the webhook section in your main() function with this:
+async def send_startup_notification(application):
+    """Send startup notification to authorized users"""
+    info = get_system_info()
+    
+    startup_message = f"""🚀 **AC Bot Started!**
+
+**Time:** {info['start_time']}
+**Running on:** {info['deployment']}
+**Platform:** {info.get('platform', 'Unknown')}
+**Python:** {info.get('python_version', 'Unknown')}
+**CPU:** {info.get('cpu_percent', 0):.1f}%
+**Memory:** {info.get('memory_percent', 0):.1f}%
+
+Bot is ready to control your AC! 🌡️
+
+{format_status_message()}"""
+    
+    for chat_id in AUTHORIZED_CHAT_IDS:
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id,
+                text=startup_message,
+                parse_mode='Markdown',
+                reply_markup=get_main_menu()
+            )
+            logger.info(f"Startup notification sent to {chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to send startup notification to {chat_id}: {e}")
+
+async def post_init(application):
+    """Called after the bot starts - send startup notification"""
+    await send_startup_notification(application)
 
 def main():
     """Start the bot"""
-    logger.info("=== STARTING TELEGRAM AC CONTROLLER BOT ===")
-    logger.info(f"Bot Token: {BOT_TOKEN[:10]}...")
-    logger.info(f"Authorized users: {AUTHORIZED_CHAT_IDS}")
-    logger.info(f"Device IP: {DEVICE_IP}")
-    logger.info(f"Device ID: {DEVICE_ID}")
-    logger.info(f"Remote ID: {REMOTE_ID}")
+    logger.info("=== STARTING ENHANCED TELEGRAM AC CONTROLLER BOT ===")
     
     if DEVICE_IP == "YOUR_PUBLIC_IP_HERE":
         logger.error("ERROR: Please replace YOUR_PUBLIC_IP_HERE with your actual public IP!")
-        logger.error("Get your public IP from: https://whatismyipaddress.com/")
         return
     
     # Create application
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(CommandHandler("cool", cool_command))
-    application.add_handler(CommandHandler("heat", heat_command))
-    application.add_handler(CommandHandler("off", off_command))
-    application.add_handler(CommandHandler("fan", fan_command))
-    
-    # Handle simple text messages
+    application.add_handler(CommandHandler("where", where_command))
+    application.add_handler(CallbackQueryHandler(handle_callback_query))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
-    
-    # Add error handler
     application.add_error_handler(error_handler)
     
     # Start bot
-    logger.info("Bot is running! Listening for commands...")
-    logger.info("=== BOT READY FOR CLOUD DEPLOYMENT ===")
+    logger.info("Bot is running with enhanced menu interface!")
     
-    # Use webhook for cloud deployment (if PORT is set) or polling for local testing
     port = int(os.environ.get("PORT", 0))
     if port:
-        # Get the webhook URL - try multiple environment variables
         render_url = os.environ.get('RENDER_EXTERNAL_URL') or os.environ.get('RENDER_SERVICE_URL')
-        
         if not render_url:
             logger.error("ERROR: RENDER_EXTERNAL_URL environment variable not set!")
-            logger.error("Please set RENDER_EXTERNAL_URL to your Render app URL in the dashboard")
-            logger.error("Example: telegram-ac-bot-xyz.onrender.com")
             return
         
-        # Handle URLs that may or may not include https://
-        if render_url.startswith('https://'):
-            webhook_url = f"{render_url}/webhook"
-        else:
-                webhook_url = f"https://{render_url}/webhook"
+        webhook_url = f"https://{render_url}/webhook" if not render_url.startswith('https://') else f"{render_url}/webhook"
+        logger.info(f"Starting webhook mode: {webhook_url}")
         
-        logger.info(f"Raw RENDER_EXTERNAL_URL: '{render_url}'")
-        logger.info(f"Final webhook URL: '{webhook_url}'")
-        
-        # Cloud deployment with webhook
-        logger.info(f"Starting webhook mode on port {port}")
         application.run_webhook(
             listen="0.0.0.0",
             port=port,
@@ -353,12 +522,8 @@ def main():
             webhook_url=webhook_url
         )
     else:
-        # Local testing with polling
         logger.info("Starting polling mode for local testing")
         application.run_polling()
-
-
-
 
 if __name__ == "__main__":
     main()
