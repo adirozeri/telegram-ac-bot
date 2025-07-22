@@ -11,6 +11,10 @@ from aioswitcher.api import SwitcherApi
 from aioswitcher.api.remotes import SwitcherBreezeRemoteManager
 from aioswitcher.device import DeviceType, DeviceState, ThermostatFanLevel, ThermostatMode, ThermostatSwing
 
+from dotenv import load_dotenv
+load_dotenv()  # This loads the .env file
+
+
 # Configure logging for cloud deployment
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -19,18 +23,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot Configuration - using environment variables for security
-BOT_TOKEN = "7749658228:AAHVodV0YEWj-drf5MUGZWob5IG-mU-CSYw"
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 AUTHORIZED_CHAT_IDS = [
-    int(os.getenv("CHAT_ID_1", "999186130")),
-    int(os.getenv("CHAT_ID_2", "922682443"))
+    int(os.getenv("CHAT_ID_1")),
+    int(os.getenv("CHAT_ID_2"))
 ]
 
 # Switcher Breeze Configuration - using environment variables
-DEVICE_IP = os.getenv("DEVICE_IP", "46.120.215.94")
-DEVICE_ID = os.getenv("DEVICE_ID", "645eb7")
-DEVICE_KEY = os.getenv("DEVICE_KEY", "03")
-TOKEN = os.getenv("SWITCHER_TOKEN", "yr60o/WGJZVRCxBd6ywclg==")
-REMOTE_ID = os.getenv("REMOTE_ID", "ELEC7009")
+DEVICE_IP = os.getenv("DEVICE_IP")
+DEVICE_ID = os.getenv("DEVICE_ID")
+DEVICE_KEY = os.getenv("DEVICE_KEY")
+TOKEN = os.getenv("SWITCHER_TOKEN")
+REMOTE_ID = os.getenv("REMOTE_ID")
 
 DEVICE_TYPE = DeviceType.BREEZE
 
