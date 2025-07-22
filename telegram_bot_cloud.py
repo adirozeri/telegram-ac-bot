@@ -1,6 +1,28 @@
+"""
+Enhanced Telegram AC Controller Bot - Clean Version
+Load environment variables FIRST before anything else
+"""
+
+# CRITICAL: Load environment variables BEFORE any other imports
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env file immediately - before any other operations
+script_dir = Path(__file__).parent
+env_path = script_dir / '.env'
+load_dotenv(env_path, override=True)
+
+# Verify critical variables are loaded
+bot_token = os.getenv("BOT_TOKEN")
+if not bot_token:
+    print("❌ ERROR: BOT_TOKEN not found in environment variables!")
+    print("Please check your .env file exists and contains BOT_TOKEN=your_token_here")
+    exit(1)
+
+# Now import everything else
 import asyncio
 import logging
-import os
 import platform
 import socket
 import psutil
@@ -11,24 +33,44 @@ from aioswitcher.api import SwitcherApi
 from aioswitcher.api.remotes import SwitcherBreezeRemoteManager
 from aioswitcher.device import DeviceType, DeviceState, ThermostatFanLevel, ThermostatMode, ThermostatSwing
 
-from dotenv import load_dotenv
-load_dotenv()  # This loads the .env file
+# Configure logging properly to prevent token exposure
+def setup_logging():
+    """Configure logging with security considerations"""
+    # Main application logging
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO,
+        handlers=[
+            logging.StreamHandler(),  # Console output
+            # Uncomment for file logging:
+            # logging.FileHandler('/home/pi/telegram-ac-bot/bot.log', mode='a')
+        ]
+    )
+    
+    # Silence noisy third-party libraries to prevent token exposure
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("aioswitcher").setLevel(logging.WARNING)
+    
+    return logging.getLogger(__name__)
 
-
-# Configure logging for cloud deployment
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# Setup logging and get main logger
+logger = setup_logging()
 
 # Bot Configuration - using environment variables for security
+BOT_TOKEN = bot_token  # Use the verified token from above
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-AUTHORIZED_CHAT_IDS = [
-    int(os.getenv("CHAT_ID_1")),
-    int(os.getenv("CHAT_ID_2"))
-]
+# Handle missing environment variables gracefully
+try:
+    AUTHORIZED_CHAT_IDS = [
+        int(os.getenv("CHAT_ID_1")),
+        int(os.getenv("CHAT_ID_2"))
+    ]
+except (TypeError, ValueError) as e:
+    logger.error(f"Error reading CHAT_ID environment variables: {e}")
+    logger.error("Please ensure CHAT_ID_1 and CHAT_ID_2 are set in your .env file or environment variables")
+    exit(1)
 
 # Switcher Breeze Configuration - using environment variables
 DEVICE_IP = os.getenv("DEVICE_IP")
@@ -36,6 +78,21 @@ DEVICE_ID = os.getenv("DEVICE_ID")
 DEVICE_KEY = os.getenv("DEVICE_KEY")
 TOKEN = os.getenv("SWITCHER_TOKEN")
 REMOTE_ID = os.getenv("REMOTE_ID")
+
+# Verify all required variables are loaded
+required_vars = {
+    'DEVICE_IP': DEVICE_IP,
+    'DEVICE_ID': DEVICE_ID,
+    'DEVICE_KEY': DEVICE_KEY,
+    'SWITCHER_TOKEN': TOKEN,
+    'REMOTE_ID': REMOTE_ID
+}
+
+missing_vars = [key for key, value in required_vars.items() if not value]
+if missing_vars:
+    logger.error(f"Missing required environment variables: {missing_vars}")
+    logger.error("Please check your .env file contains all required variables")
+    exit(1)
 
 DEVICE_TYPE = DeviceType.BREEZE
 
@@ -345,7 +402,11 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     
     if data == "toggle_power":
-        # Toggle AC power based on current state
+        # First get current AC status to ensure accuracy
+        await query.edit_message_text("🔄 Checking AC status...")
+        current_state = await ac.get_status()
+        
+        # Toggle AC power based on current state with better status checking
         if ac_state["is_on"]:
             # AC is currently ON, so turn it OFF
             await query.edit_message_text("🔄 Turning AC OFF...")
@@ -359,7 +420,7 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_text("🔄 Turning AC ON...")
             success = await ac.control_ac(True, "COOL", ac_state["temperature"])
             if success:
-                message = f"✅ AC turned ON successfully!\n\n{format_status_message()}"
+                message = f"✅ AC turned ON successfully at {ac_state['temperature']}°C!\n\n{format_status_message()}"
             else:
                 message = f"❌ Failed to turn ON AC\n\n{format_status_message()}"
         
@@ -397,14 +458,14 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         # Turn on AC with selected temperature
         success = await ac.control_ac(True, "COOL", temp)
         if success:
-            message = f"✅ AC set to {temp}°C!\n\n{format_status_message()}"
+            message = f"✅ AC set to {temp}°C and turned ON!\n\n{format_status_message()}"
         else:
             message = f"❌ Failed to set temperature\n\n{format_status_message()}"
         await query.edit_message_text(message, reply_markup=get_main_menu(), parse_mode='Markdown')
     
     elif data == "status":
-        # Refresh status from device
-        await query.edit_message_text("🔄 Getting AC status...")
+        # Refresh status from device with better feedback
+        await query.edit_message_text("🔄 Getting AC status from device...")
         device_state = await ac.get_status()
         if device_state:
             message = f"📊 Status refreshed from device\n\n{format_status_message()}"
@@ -492,10 +553,6 @@ async def post_init(application):
 def main():
     """Start the bot"""
     logger.info("=== STARTING ENHANCED TELEGRAM AC CONTROLLER BOT ===")
-    
-    if DEVICE_IP == "YOUR_PUBLIC_IP_HERE":
-        logger.error("ERROR: Please replace YOUR_PUBLIC_IP_HERE with your actual public IP!")
-        return
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
