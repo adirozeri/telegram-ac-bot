@@ -98,7 +98,10 @@ if missing_vars:
 DEVICE_TYPE = DeviceType.BREEZE
 
 # Reliability tuning
-DISCOVERY_TIMEOUT = 6      # seconds to listen for the device's UDP broadcast
+# NOTE: the Breeze broadcasts its presence only every ~20-30s, so the discovery
+# window must be long enough to catch at least one broadcast. Discovery only runs
+# when the cached/last-known IP fails, so this slow path is the rare case.
+DISCOVERY_TIMEOUT = 35     # seconds to listen for the device's UDP broadcast
 COMMAND_TIMEOUT = 12       # seconds for a full login+control round-trip
 MAX_ATTEMPTS = 2           # command attempts before giving up (re-discovers between tries)
 
