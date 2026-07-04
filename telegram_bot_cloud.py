@@ -22,6 +22,7 @@ if not bot_token:
 
 # Now import everything else
 import asyncio
+import json
 import logging
 import platform
 import socket
@@ -198,11 +199,15 @@ class ACController:
         return True
 
 
+CYCLE_STATE_FILE = Path(__file__).parent / "cycle_state.json"
+
+
 class CycleManager:
     """Runs an ON/OFF duty cycle: hold ON for on_min, then OFF for off_min, repeat.
 
     Drives the AC with explicit ON/OFF commands (never relies on device state),
-    starting with ON. Held in memory only — a bot restart clears any active cycle.
+    starting with ON. The active cycle is persisted to CYCLE_STATE_FILE so it
+    survives a bot restart / reboot / deploy (resumed from the ON phase).
     """
 
     def __init__(self, controller):
@@ -210,21 +215,54 @@ class CycleManager:
         self.task = None
         self.on_min = None
         self.off_min = None
+        self.chat_id = None
 
     @property
     def running(self):
         return self.task is not None and not self.task.done()
 
-    def start(self, on_min, off_min, bot, chat_id):
-        self.stop()
-        self.on_min, self.off_min = on_min, off_min
+    def start(self, on_min, off_min, bot, chat_id, persist=True):
+        self.stop(clear_file=False)
+        self.on_min, self.off_min, self.chat_id = on_min, off_min, chat_id
+        if persist:
+            self._save()
         self.task = asyncio.create_task(self._run(on_min, off_min, bot, chat_id))
 
-    def stop(self):
+    def stop(self, clear_file=True):
         if self.task and not self.task.done():
             self.task.cancel()
         self.task = None
-        self.on_min = self.off_min = None
+        self.on_min = self.off_min = self.chat_id = None
+        if clear_file:
+            self._clear()
+
+    def _save(self):
+        try:
+            CYCLE_STATE_FILE.write_text(json.dumps(
+                {"on": self.on_min, "off": self.off_min, "chat_id": self.chat_id}))
+        except Exception as e:
+            logger.error(f"Could not save cycle state: {e}")
+
+    def _clear(self):
+        try:
+            CYCLE_STATE_FILE.unlink(missing_ok=True)
+        except Exception as e:
+            logger.error(f"Could not clear cycle state: {e}")
+
+    def resume(self, bot):
+        """Resume a persisted cycle on startup. Returns True if one was restored."""
+        try:
+            if not CYCLE_STATE_FILE.exists():
+                return False
+            data = json.loads(CYCLE_STATE_FILE.read_text())
+            on_min, off_min, chat_id = int(data["on"]), int(data["off"]), int(data["chat_id"])
+        except Exception as e:
+            logger.error(f"Could not read cycle state ({e}); discarding it")
+            self._clear()
+            return False
+        logger.info(f"Resuming persisted cycle: {on_min}m on / {off_min}m off")
+        self.start(on_min, off_min, bot, chat_id, persist=False)
+        return True
 
     async def _run(self, on_min, off_min, bot, chat_id):
         intend_on = True  # start with ON
@@ -522,8 +560,17 @@ Bot is ready to control your AC! 🌡️"""
             logger.error(f"Failed to send startup notification to {chat_id}: {e}")
 
 async def post_init(application):
-    """Called after the bot starts - send startup notification"""
+    """Called after the bot starts - send startup notification, resume any saved cycle"""
     await send_startup_notification(application)
+    if cycle.resume(application.bot):
+        try:
+            await application.bot.send_message(
+                chat_id=cycle.chat_id,
+                text=f"🔁 Resumed Auto Cycle after restart: {cycle.on_min}m on / {cycle.off_min}m off (starting ON).",
+                reply_markup=get_control_menu(),
+            )
+        except Exception as e:
+            logger.error(f"Resume notify failed: {e}")
 
 def main():
     """Start the bot"""
