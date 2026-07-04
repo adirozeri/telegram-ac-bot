@@ -197,8 +197,67 @@ class ACController:
         logger.info(f"Button logic flipped. Buttons flipped: {buttons_flipped}")
         return True
 
-# Initialize AC controller
+
+class CycleManager:
+    """Runs an ON/OFF duty cycle: hold ON for on_min, then OFF for off_min, repeat.
+
+    Drives the AC with explicit ON/OFF commands (never relies on device state),
+    starting with ON. Held in memory only — a bot restart clears any active cycle.
+    """
+
+    def __init__(self, controller):
+        self.ac = controller
+        self.task = None
+        self.on_min = None
+        self.off_min = None
+
+    @property
+    def running(self):
+        return self.task is not None and not self.task.done()
+
+    def start(self, on_min, off_min, bot, chat_id):
+        self.stop()
+        self.on_min, self.off_min = on_min, off_min
+        self.task = asyncio.create_task(self._run(on_min, off_min, bot, chat_id))
+
+    def stop(self):
+        if self.task and not self.task.done():
+            self.task.cancel()
+        self.task = None
+        self.on_min = self.off_min = None
+
+    async def _run(self, on_min, off_min, bot, chat_id):
+        intend_on = True  # start with ON
+        try:
+            while True:
+                # Honour the same flip the manual buttons use, so the cycle's
+                # "ON" produces the same physical action as the 🟢 button.
+                if intend_on ^ buttons_flipped:
+                    ok, err = await self.ac.turn_on_ac()
+                else:
+                    ok, err = await self.ac.turn_off_ac()
+
+                label = "ON" if intend_on else "OFF"
+                hold = on_min if intend_on else off_min
+                logger.info(f"Cycle tick: {label} (ok={ok}) holding {hold} min")
+                try:
+                    if ok:
+                        text = f"🔁 Cycle: AC {label} — holding {hold} min"
+                    else:
+                        text = f"🔁 Cycle: {label} command failed ({err}) — holding {hold} min"
+                    await bot.send_message(chat_id=chat_id, text=text)
+                except Exception as e:
+                    logger.error(f"Cycle notify failed: {e}")
+
+                await asyncio.sleep(hold * 60)
+                intend_on = not intend_on
+        except asyncio.CancelledError:
+            logger.info("Cycle stopped")
+            raise
+
+# Initialize AC controller and cycle manager
 ac = ACController()
+cycle = CycleManager(ac)
 
 def get_system_info():
     """Get system information for monitoring"""
@@ -240,8 +299,10 @@ def check_authorization(update: Update) -> bool:
         logger.warning(f"Unauthorized access attempt from user ID: {user_id}")
     return authorized
 
+CYCLE_PRESETS = [5, 10, 15, 30, 60]  # minutes
+
 def get_control_menu():
-    """Create AC control menu with on, off, and flip state buttons"""
+    """Create AC control menu with on, off, flip, and auto-cycle buttons"""
     keyboard = [
         [
             InlineKeyboardButton("🟢 Turn ON", callback_data="turn_on"),
@@ -249,6 +310,29 @@ def get_control_menu():
         ],
         [InlineKeyboardButton("🔄 Flip AC State", callback_data="flip_state")]
     ]
+    if cycle.running:
+        keyboard.append([InlineKeyboardButton(
+            f"🛑 Stop Cycle ({cycle.on_min}m on / {cycle.off_min}m off)",
+            callback_data="cycle_stop")])
+    else:
+        keyboard.append([InlineKeyboardButton("🔁 Auto Cycle", callback_data="cycle_menu")])
+    return InlineKeyboardMarkup(keyboard)
+
+def _preset_rows(callback_prefix):
+    """Build rows of preset-minute buttons, 3 per row, with the given callback prefix."""
+    buttons = [InlineKeyboardButton(f"{m} min", callback_data=f"{callback_prefix}{m}") for m in CYCLE_PRESETS]
+    return [buttons[i:i + 3] for i in range(0, len(buttons), 3)]
+
+def get_cycle_on_menu():
+    """Step 1: choose how long the AC stays ON each cycle."""
+    keyboard = _preset_rows("cycleon_")
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="back_to_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_cycle_off_menu(on_min):
+    """Step 2: choose how long the AC stays OFF (on_min carried in callback data)."""
+    keyboard = _preset_rows(f"cyclego_{on_min}_")
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="cycle_menu")])
     return InlineKeyboardMarkup(keyboard)
 
 # Command handlers
@@ -356,6 +440,43 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         
         await query.edit_message_text(
             message,
+            reply_markup=get_control_menu()
+        )
+
+    elif data == "cycle_menu":
+        await query.edit_message_text(
+            "🔁 *Auto Cycle* — step 1 of 2\n\nHow long should the AC stay *ON* each cycle?",
+            reply_markup=get_cycle_on_menu(),
+            parse_mode='Markdown'
+        )
+
+    elif data == "back_to_main":
+        await query.edit_message_text(
+            "🤖 Use the buttons below to control your AC:",
+            reply_markup=get_control_menu()
+        )
+
+    elif data == "cycle_stop":
+        cycle.stop()
+        await query.edit_message_text(
+            "🛑 Auto Cycle stopped.",
+            reply_markup=get_control_menu()
+        )
+
+    elif data.startswith("cycleon_"):
+        on_min = int(data.split("_")[1])
+        await query.edit_message_text(
+            f"🔁 *Auto Cycle* — step 2 of 2\n\n🟢 ON = *{on_min} min*.\nNow how long should the AC stay *OFF*?",
+            reply_markup=get_cycle_off_menu(on_min),
+            parse_mode='Markdown'
+        )
+
+    elif data.startswith("cyclego_"):
+        _, on_s, off_s = data.split("_")
+        on_min, off_min = int(on_s), int(off_s)
+        cycle.start(on_min, off_min, context.bot, update.effective_chat.id)
+        await query.edit_message_text(
+            f"🔁 Auto Cycle started:\n🟢 ON for {on_min} min → 🔴 OFF for {off_min} min → repeat.\n\nSending ON now…",
             reply_markup=get_control_menu()
         )
 
