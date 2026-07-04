@@ -3,3 +3,7 @@ a.txt
 .venv
 .env
 tests.ipynb
+
+# Secrets / local-only
+claude_ssh
+.claude/settings.local.json
