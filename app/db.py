@@ -5,9 +5,13 @@ settings table. WAL + busy_timeout so both processes can read/write safely.
 Connections are opened per call (cheap; commands are infrequent).
 """
 import logging
-import sqlite3
 import time
 from contextlib import contextmanager
+
+try:  # stdlib on normal builds
+    import sqlite3
+except ModuleNotFoundError:  # Pi's /usr/local Python was built without _sqlite3
+    from pysqlite3 import dbapi2 as sqlite3
 
 from . import config
 
