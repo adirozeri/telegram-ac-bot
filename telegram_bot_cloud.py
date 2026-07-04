@@ -190,9 +190,18 @@ def get_system_info():
         else:
             deployment = "💻 Local Computer"
         
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            host_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            host_ip = "Unknown"
+
         return {
             "deployment": deployment,
-            "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "host_ip": host_ip
         }
     except Exception as e:
         logger.error(f"Error getting system info: {e}")
@@ -350,6 +359,7 @@ async def send_startup_notification(application):
 
 **Time:** {info['start_time']}
 **Running on:** {info['deployment']}
+**Bot IP:** {info['host_ip']}
 
 Bot is ready to control your AC! 🌡️"""
     
