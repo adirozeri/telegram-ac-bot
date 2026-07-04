@@ -1,21 +1,24 @@
-"""SQLite layer shared by the bot and the web app.
+"""Tiny stdlib-only storage shared by the bot and the web app.
 
-One database (ac_data.db) with an event log (ON/OFF intents) and a key/value
-settings table. WAL + busy_timeout so both processes can read/write safely.
-Connections are opened per call (cheap; commands are infrequent).
+Deliberately not SQLite: the Pi's hand-built Python lacks the _sqlite3
+extension, and the data is tiny. Events are an append-only JSONL log; settings
+are a small JSON object. Cross-process access (bot + web) is guarded with
+fcntl file locks. No third-party deps, nothing to compile.
 """
+import fcntl
+import json
 import logging
+import os
 import time
 from contextlib import contextmanager
-
-try:  # stdlib on normal builds
-    import sqlite3
-except ModuleNotFoundError:  # Pi's /usr/local Python was built without _sqlite3
-    from pysqlite3 import dbapi2 as sqlite3
 
 from . import config
 
 logger = logging.getLogger(__name__)
+
+_BASE = config.DB_PATH
+EVENTS_FILE = _BASE.with_name(_BASE.stem + "_events.jsonl")
+SETTINGS_FILE = _BASE.with_name(_BASE.stem + "_settings.json")
 
 _DEFAULT_SETTINGS = {
     "cost_per_min": "0",
@@ -25,62 +28,79 @@ _DEFAULT_SETTINGS = {
 
 
 @contextmanager
-def _connect():
-    conn = sqlite3.connect(config.DB_PATH, timeout=10)
+def _settings_rw():
+    """Open the settings file under an exclusive lock for read-modify-write."""
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    f = open(SETTINGS_FILE, "a+")
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
-        yield conn
-        conn.commit()
+        fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        raw = f.read()
+        try:
+            data = json.loads(raw) if raw.strip() else {}
+        except json.JSONDecodeError:
+            data = {}
+        yield data
+        f.seek(0)
+        f.truncate()
+        f.write(json.dumps(data))
+        f.flush()
+        os.fsync(f.fileno())
     finally:
-        conn.close()
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+
+
+def _read_settings():
+    if not SETTINGS_FILE.exists():
+        return {}
+    try:
+        with open(SETTINGS_FILE) as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            try:
+                raw = f.read()
+                return json.loads(raw) if raw.strip() else {}
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 def init_db():
-    with _connect() as conn:
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts REAL NOT NULL,
-                action TEXT NOT NULL,
-                source TEXT NOT NULL,
-                success INTEGER NOT NULL
-            )"""
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)")
-        conn.execute(
-            """CREATE TABLE IF NOT EXISTS settings (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )"""
-        )
+    EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    EVENTS_FILE.touch(exist_ok=True)
+    with _settings_rw() as data:
         for k, v in _DEFAULT_SETTINGS.items():
-            conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
-    logger.info("DB initialized at %s", config.DB_PATH)
+            data.setdefault(k, v)
+    logger.info("Storage initialized (events=%s, settings=%s)", EVENTS_FILE, SETTINGS_FILE)
 
 
-def log_event(action, source, success):
-    """Record an ON/OFF intent. action in {'ON','OFF'}, source in {web,telegram,cycle}."""
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO events (ts, action, source, success) VALUES (?, ?, ?, ?)",
-            (time.time(), action, source, 1 if success else 0),
-        )
+def log_event(action, source, success, ts=None):
+    """Append an ON/OFF intent. action in {'ON','OFF'}, source in {web,telegram,cycle}."""
+    rec = {
+        "ts": time.time() if ts is None else ts,
+        "action": action,
+        "source": source,
+        "success": 1 if success else 0,
+    }
+    EVENTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(EVENTS_FILE, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(rec) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def get_setting(key, default=None):
-    with _connect() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return row[0] if row else default
+    return _read_settings().get(key, default)
 
 
 def set_setting(key, value):
-    with _connect() as conn:
-        conn.execute(
-            "INSERT INTO settings (key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
-        )
+    with _settings_rw() as data:
+        data[key] = str(value)
 
 
 def get_flip():
@@ -95,14 +115,20 @@ def set_flip(flipped):
 
 def get_events(since=None):
     """Return event dicts ordered by ts. `since` is an epoch lower bound."""
-    with _connect() as conn:
-        if since is None:
-            rows = conn.execute(
-                "SELECT ts, action, source, success FROM events ORDER BY ts"
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT ts, action, source, success FROM events WHERE ts>=? ORDER BY ts",
-                (since,),
-            ).fetchall()
-    return [dict(ts=r[0], action=r[1], source=r[2], success=r[3]) for r in rows]
+    if not EVENTS_FILE.exists():
+        return []
+    events = []
+    with open(EVENTS_FILE) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if since is not None and e.get("ts", 0) < since:
+                continue
+            events.append(e)
+    events.sort(key=lambda e: e.get("ts", 0))
+    return events

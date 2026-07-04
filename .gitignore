@@ -14,6 +14,5 @@ __pycache__/
 
 # Runtime state
 cycle_state.json
-ac_data.db
-ac_data.db-wal
-ac_data.db-shm
+ac_data_events.jsonl
+ac_data_settings.json
