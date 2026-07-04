@@ -31,6 +31,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from aioswitcher.api import SwitcherApi
 from aioswitcher.api.remotes import SwitcherBreezeRemoteManager
+from aioswitcher.bridge import SwitcherBridge
 from aioswitcher.device import DeviceType, DeviceState, ThermostatFanLevel, ThermostatMode, ThermostatSwing
 
 # Configure logging properly to prevent token exposure
@@ -96,77 +97,98 @@ if missing_vars:
 
 DEVICE_TYPE = DeviceType.BREEZE
 
+# Reliability tuning
+DISCOVERY_TIMEOUT = 6      # seconds to listen for the device's UDP broadcast
+COMMAND_TIMEOUT = 12       # seconds for a full login+control round-trip
+MAX_ATTEMPTS = 2           # command attempts before giving up (re-discovers between tries)
+
 # Global variable for button logic state
 buttons_flipped = False
 
 class ACController:
     def __init__(self):
         self.remote_manager = SwitcherBreezeRemoteManager()
-    
-    async def toggle_ac(self):
-        """Send toggle command to AC"""
+        # Last-known IP. DEVICE_IP from .env is only a starting hint, not the
+        # source of truth — the device is located by DEVICE_ID via discovery.
+        self._ip = DEVICE_IP or None
+        self._key = DEVICE_KEY
+
+    async def discover(self, timeout=DISCOVERY_TIMEOUT):
+        """Find the device's current IP by listening for its UDP broadcast.
+
+        Switcher devices get DHCP addresses that drift, so we match on the stable
+        DEVICE_ID rather than a hardcoded IP. Returns the IP, or None on timeout.
+        """
+        loop = asyncio.get_event_loop()
+        found = loop.create_future()
+
+        def on_device(device):
+            if device.device_id == DEVICE_ID and not found.done():
+                found.set_result(device)
+
         try:
-            logger.info(f"Sending toggle command to AC at {DEVICE_IP}")
-            async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
-                remote = self.remote_manager.get_remote(REMOTE_ID)
-                
-                await api.control_breeze_device(
-                    remote, 
-                    DeviceState.ON,
-                    ThermostatMode.COOL,
-                    0,  # Let AC use last temperature setting
-                    ThermostatFanLevel.MEDIUM,
-                    ThermostatSwing.OFF
-                )
-                
-                logger.info(f"Toggle command sent successfully")
-                return True
+            async with SwitcherBridge(on_device):
+                device = await asyncio.wait_for(found, timeout)
+            self._ip = device.ip_address
+            if getattr(device, "device_key", None):
+                self._key = device.device_key
+            logger.info(f"Discovered device {DEVICE_ID} at {self._ip}")
+            return self._ip
+        except asyncio.TimeoutError:
+            logger.warning(f"Discovery timed out after {timeout}s (device {DEVICE_ID} not heard on LAN)")
+            return None
         except Exception as e:
-            logger.error(f"Error sending toggle command: {e}")
-            return False
-    
+            logger.error(f"Discovery error: {e}")
+            return None
+
+    async def _send(self, *args, label="command"):
+        """Send a Breeze control command, (re)discovering the IP and retrying.
+
+        Returns (ok: bool, error: str|None) so callers can surface a real reason.
+        """
+        last_err = None
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            if not self._ip:
+                await self.discover()
+            if not self._ip:
+                last_err = "device not found on the network"
+                continue
+            try:
+                async with asyncio.timeout(COMMAND_TIMEOUT):
+                    async with SwitcherApi(DEVICE_TYPE, self._ip, DEVICE_ID, self._key, token=TOKEN) as api:
+                        remote = self.remote_manager.get_remote(REMOTE_ID)
+                        await api.control_breeze_device(remote, *args)
+                logger.info(f"{label} sent successfully to {self._ip}")
+                return True, None
+            except (asyncio.TimeoutError, OSError) as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.warning(f"{label} attempt {attempt}/{MAX_ATTEMPTS} failed ({last_err}); re-discovering")
+                self._ip = None  # force fresh discovery on the next attempt
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                logger.error(f"{label} attempt {attempt}/{MAX_ATTEMPTS} error: {last_err}")
+                self._ip = None
+        return False, last_err
+
     async def turn_on_ac(self):
-        """Always turn AC ON"""
-        try:
-            logger.info(f"Turning AC ON at {DEVICE_IP}")
-            async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
-                remote = self.remote_manager.get_remote(REMOTE_ID)
-                
-                await api.control_breeze_device(
-                    remote, 
-                    DeviceState.ON,
-                    ThermostatMode.COOL,
-                    0,  # Let AC use last temperature setting
-                    ThermostatFanLevel.MEDIUM,
-                    ThermostatSwing.OFF
-                )
-                
-                logger.info(f"AC ON command sent successfully")
-                return True
-        except Exception as e:
-            logger.error(f"Error turning AC ON: {e}")
-            return False
-    
+        """Send an explicit ON command (COOL, last temperature, medium fan)."""
+        return await self._send(
+            DeviceState.ON, ThermostatMode.COOL, 0,
+            ThermostatFanLevel.MEDIUM, ThermostatSwing.OFF,
+            label="ON",
+        )
+
     async def turn_off_ac(self):
-        """Always turn AC OFF"""
-        try:
-            logger.info(f"Turning AC OFF at {DEVICE_IP}")
-            async with SwitcherApi(DEVICE_TYPE, DEVICE_IP, DEVICE_ID, DEVICE_KEY) as api:
-                remote = self.remote_manager.get_remote(REMOTE_ID)
-                
-                await api.control_breeze_device(
-                    remote, 
-                    DeviceState.OFF
-                )
-                
-                logger.info(f"AC OFF command sent successfully")
-                return True
-        except Exception as e:
-            logger.error(f"Error turning AC OFF: {e}")
-            return False
-    
+        """Send an explicit OFF command."""
+        return await self._send(DeviceState.OFF, label="OFF")
+
     async def flip_switcher_state(self):
-        """Flip button logic in the bot (no communication with Switcher)"""
+        """Flip the bot's button logic (no communication with the device).
+
+        The Switcher Breeze is an IR blaster whose reported state can't be
+        trusted, so this manual override lets the user correct which physical
+        action the ON/OFF buttons actually produce.
+        """
         global buttons_flipped
         buttons_flipped = not buttons_flipped
         logger.info(f"Button logic flipped. Buttons flipped: {buttons_flipped}")
@@ -280,46 +302,46 @@ async def handle_callback_query(update: Update, context: ContextTypes.DEFAULT_TY
         # Check if buttons are flipped
         if buttons_flipped:
             # Send OFF command when buttons are flipped
-            success = await ac.turn_off_ac()
+            ok, err = await ac.turn_off_ac()
             command_sent = "OFF"
         else:
             # Send ON command normally
-            success = await ac.turn_on_ac()
+            ok, err = await ac.turn_on_ac()
             command_sent = "ON"
-        
-        if success:
+
+        if ok:
             message = f"✅ {command_sent} command sent!"
         else:
-            message = f"❌ Failed to send {command_sent} command"
-        
+            message = f"❌ Failed to send {command_sent} command\n({err})"
+
         await query.edit_message_text(
             message,
             reply_markup=get_control_menu()
         )
-    
+
     elif data == "turn_off":
         await query.edit_message_text("🔴 Sending command...")
         
         # Check if buttons are flipped
         if buttons_flipped:
             # Send ON command when buttons are flipped
-            success = await ac.turn_on_ac()
+            ok, err = await ac.turn_on_ac()
             command_sent = "ON"
         else:
             # Send OFF command normally
-            success = await ac.turn_off_ac()
+            ok, err = await ac.turn_off_ac()
             command_sent = "OFF"
-        
-        if success:
+
+        if ok:
             message = f"✅ {command_sent} command sent!"
         else:
-            message = f"❌ Failed to send {command_sent} command"
-        
+            message = f"❌ Failed to send {command_sent} command\n({err})"
+
         await query.edit_message_text(
             message,
             reply_markup=get_control_menu()
         )
-    
+
     elif data == "flip_state":
         success = await ac.flip_switcher_state()
         
