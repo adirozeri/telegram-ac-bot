@@ -8,5 +8,12 @@ tests.ipynb
 claude_ssh
 .claude/settings.local.json
 
+# Python
+__pycache__/
+*.pyc
+
 # Runtime state
 cycle_state.json
+ac_data.db
+ac_data.db-wal
+ac_data.db-shm
