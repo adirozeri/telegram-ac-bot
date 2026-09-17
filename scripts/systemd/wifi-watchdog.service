@@ -1,0 +1,7 @@
+[Unit]
+Description=Reconnect WiFi if NetworkManager has given up
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wifi-watchdog.sh

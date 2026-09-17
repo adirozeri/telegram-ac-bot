@@ -1,0 +1,8 @@
+/var/log/wifi-watchdog.log {
+    monthly
+    rotate 12
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
